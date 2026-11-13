@@ -248,6 +248,8 @@ class FluxActionPolicy(nn.Module):
         self._offload_text_encoder = False
         self.serving_setup = None
         self._inference_prepared = False
+        # Video tokens of the last _sample call (observed frame, denoised future), for inspection.
+        self.last_video_tokens: tuple[Tensor, Tensor] | None = None
         self.reset()
 
     def save_pretrained(self, directory):
@@ -956,6 +958,7 @@ class FluxActionPolicy(nn.Module):
                 guidance=guidance,
                 committed=committed if n_prefix else None,
             )
+            self.last_video_tokens = (fixed["x_video_cond"], out["x_video"])
             result = out[ak][0].float() / cfg.action_scale
             if n_prefix:
                 result[:n_prefix] = prefix_targets.to(result)
@@ -998,6 +1001,7 @@ class FluxActionPolicy(nn.Module):
             )
         else:
             out = sampling.euler(flow, predict, n_steps=cfg.num_inference_steps, alpha=cfg.sampler_shift)
+        self.last_video_tokens = (fixed["x_video_cond"], out["x_video"])
         result = out[ak][0].float() / cfg.action_scale
         if n_prefix:
             result[:n_prefix] = prefix_targets.to(result)
