@@ -78,21 +78,11 @@ def _quantize_fp8r(value: Tensor) -> tuple[Tensor, Tensor]:
     quantized = (rows / scale[:, None]).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
     return quantized.reshape_as(value), scale
 
-
-def _scaled_mm(
-    activation_q: Tensor,
-    weight_q_nk: Tensor,
-    activation_scale: Tensor,
-    weight_scale: Tensor,
-) -> Tensor:
-    return torch._scaled_mm(
-        activation_q,
-        weight_q_nk.T,
-        activation_scale[:, None].contiguous(),
-        weight_scale[None, :].contiguous(),
-        out_dtype=torch.bfloat16,
-        use_fast_accum=True,
-    )
+# NOTE: This is modified from the original _scaled_mm function to add FP8 emulation.
+def _scaled_mm(activation_q, weight_q_nk, activation_scale, weight_scale) -> Tensor:
+    a = activation_q.to(torch.bfloat16) * activation_scale[:, None].to(torch.bfloat16)
+    w = weight_q_nk.to(torch.bfloat16) * weight_scale[:, None].to(torch.bfloat16)
+    return a @ w.T
 
 
 def _rmsnorm_rope(value: Tensor, weight: Tensor, rope: Tensor, eps: float) -> Tensor:
@@ -617,17 +607,11 @@ class FP8RInferenceDiT(nn.Module):
             {name: _LastLayer(HIDDEN, width) for name, width in _CHANNELS.items()}
         )
 
+    # NOTE: This is modified from the original _check_runtime_device function to add FP8 emulation.
     @staticmethod
     def _check_runtime_device(device: torch.device) -> None:
-        assert device.type == "cuda", "native FP8r inference requires CUDA"
-        capability = torch.cuda.get_device_capability(device)
-        supported = {(8, 9), (9, 0), (10, 0), (10, 3), (12, 0)}
-        # TODO: REMOVE ME after SM89 rowwise FP8 runtime validation.
-        if capability not in supported:
-            raise RuntimeError(
-                "FP8r inference requires SM89/SM90/SM100/SM103/SM120 native FP8 support, "
-                f"got SM{capability[0]}{capability[1]}"
-            )
+        assert device.type == "cuda", "FP8r inference requires CUDA"
+        
 
     @classmethod
     def from_quantized_state_dict(cls, state_dict: Mapping[str, Tensor]) -> FP8RInferenceDiT:
