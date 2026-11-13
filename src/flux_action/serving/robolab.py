@@ -118,11 +118,9 @@ def decode_imagined_video(policy) -> np.ndarray:
     h, w = policy.config.latent_hw
     tokens = torch.cat([condition, future.to(condition.dtype)], dim=1)
     latents = rearrange(tokens, "b (t h w) c -> b c t h w", h=h, w=w)
-    vae = policy.video_vae
-    weight = next(iter(vae.parameters()), None)
-    dtype = torch.bfloat16 if weight is None or weight.dtype == torch.bfloat16 else weight.dtype
     with torch.inference_mode():
-        pixels = vae.decode(latents.to(dtype))  # (1, 3, 4 * T_lat - 3, 32 h, 32 w) in [-1, 1]
+        # BF16, as packing.encode_single_frame feeds the same VAE (a wrapper, not an nn.Module).
+        pixels = policy.video_vae.decode(latents.to(torch.bfloat16))  # (1, 3, 4 T_lat - 3, 32 h, 32 w)
     content_h, content_w = COMPOSITE_HW
     pixels = pixels[0, :, :, :content_h, :content_w].float().add(1).mul(127.5).round().clamp(0, 255)
     return pixels.to(torch.uint8).permute(1, 2, 3, 0).cpu().numpy()
@@ -181,18 +179,23 @@ class RoboLabPolicy:
         """Write the input image and the decoded imagined video of the last query, if any.
 
         The server calls this right after sending the response; ``infer`` also calls it first, so a
-        pending query is never overwritten by the next prediction.
+        pending query is never overwritten by the next prediction. A failure here is reported and
+        skipped: saving a video must never close the connection that is controlling a robot.
         """
         pending, self._pending_video = self._pending_video, None
         if pending is None:
             return
         query, image = pending
-        started = time.perf_counter()
-        frames = decode_imagined_video(self.policy)
         stem = self.log_dir / f"query_{query:06d}"
-        write_png(stem.with_name(stem.name + "_input.png"), image)
-        write_mp4(stem.with_name(stem.name + "_imagined.mp4"), frames, self.policy.config.fps)
-        write_png(stem.with_name(stem.name + "_imagined.png"), contact_sheet(image, frames))
+        started = time.perf_counter()
+        try:
+            write_png(stem.with_name(stem.name + "_input.png"), image)
+            frames = decode_imagined_video(self.policy)
+            write_mp4(stem.with_name(stem.name + "_imagined.mp4"), frames, self.policy.config.fps)
+            write_png(stem.with_name(stem.name + "_imagined.png"), contact_sheet(image, frames))
+        except Exception:
+            print(f"query {query}: imagined video not saved\n{traceback.format_exc()}", flush=True)
+            return
         elapsed = time.perf_counter() - started
         print(f"query {query}: {len(frames)} imagined frames saved in {elapsed:.2f}s", flush=True)
 

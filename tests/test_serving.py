@@ -282,10 +282,26 @@ def test_nonfinite_actions_are_rejected_before_logging(tmp_path, monkeypatch, va
     assert not (tmp_path / "logs").exists()
 
 
-class _DecodingVAE(FakeVideoVAE):
-    """Shape-only decode: (B, 96, T, h, w) -> (B, 3, 4 T - 3, 32 h, 32 w) in [-1, 1]."""
+class _DecodingVAE:
+    """Like the real VideoVAE: a plain wrapper (no ``parameters()``) around a module.
+
+    Shape-only decode: (B, 96, T, h, w) -> (B, 3, 4 T - 3, 32 h, 32 w) in [-1, 1].
+    """
+
+    def __init__(self):
+        self.module = FakeVideoVAE()
+
+    def encode(self, video):
+        return self.module.encode(video)
+
+    def encode_task(self, video):
+        return self.module.encode_task(video)
+
+    def encode_frame(self, frame):
+        return self.module.encode_frame(frame)
 
     def decode(self, z):
+        assert z.dtype == torch.bfloat16, "decoded with the dtype the policy encodes with"
         b, _, t, h, w = z.shape
         value = torch.tanh(z.float().mean(dim=1, keepdim=True))
         frames = value.repeat_interleave(4, dim=2)[:, :, 3:]
@@ -327,3 +343,20 @@ def test_imagined_video_is_saved_after_the_response(tmp_path):
 def test_saving_video_needs_a_log_dir():
     with pytest.raises(ValueError, match="log_dir"):
         RoboLabPolicy(droid_policy(), save_video=True)
+
+
+def test_a_failed_video_save_keeps_serving(tmp_path, monkeypatch, capsys):
+    pytest.importorskip("av")
+    pytest.importorskip("PIL")
+    import flux_action.serving.robolab as robolab
+
+    def broken(policy):
+        raise RuntimeError("decoder out of memory")
+
+    monkeypatch.setattr(robolab, "decode_imagined_video", broken)
+    adapter = RoboLabPolicy(droid_policy(_DecodingVAE()), log_dir=tmp_path, save_video=True)
+    adapter.infer(sample_obs())
+    adapter.flush()  # reports, does not raise
+    assert "imagined video not saved" in capsys.readouterr().out
+    assert (tmp_path / "query_000001_input.png").is_file()
+    assert adapter.infer(sample_obs())["action"].shape == (32, 8)
