@@ -197,6 +197,12 @@ def main():
     serve.add_argument("--device", default="cuda")
     serve.add_argument("--log-dir", default=None, help="record every query (npz + json) here")
     serve.add_argument(
+        "--save-video",
+        action="store_true",
+        help="with --log-dir: also save each query's input image and the imagined future video "
+        "(decoded after the response; needs --extra data)",
+    )
+    serve.add_argument(
         "--setting", action="append", default=[], metavar="KEY=VALUE", help="inference override"
     )
     _add_precision_arguments(serve, compile_default=True)
@@ -334,7 +340,7 @@ def main():
             **precision,
         )
         if args.command == "serve-robolab":
-            adapter = RoboLabPolicy(policy, log_dir=args.log_dir)
+            adapter = RoboLabPolicy(policy, log_dir=args.log_dir, save_video=args.save_video)
             print(
                 json.dumps(
                     {

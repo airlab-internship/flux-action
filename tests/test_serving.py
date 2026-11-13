@@ -23,6 +23,7 @@ import threading
 import numpy as np
 import pytest
 import torch
+import torch.nn.functional as F  # noqa: N812
 from conftest import FakeVideoVAE, tiny_config
 
 msgpack = pytest.importorskip("msgpack")  # the OpenPI wire format; flux_action.serving needs the serve extra
@@ -88,7 +89,7 @@ def test_codec_is_byte_identical_to_openpi_and_round_trips():
         protocol.packb({"x": np.array([object()])})
 
 
-def droid_policy():
+def droid_policy(video_vae=None):
     config = tiny_config(
         camera_layout="droid",
         camera_keys=("images.wrist", "images.left", "images.right"),
@@ -96,7 +97,7 @@ def droid_policy():
         action_dim=8,
         gripper_flip_dims=(-1,),
     )
-    return FluxActionPolicy(config, video_vae=FakeVideoVAE(), text_encoder=MockTextEncoder(32))
+    return FluxActionPolicy(config, video_vae=video_vae or FakeVideoVAE(), text_encoder=MockTextEncoder(32))
 
 
 @pytest.fixture(scope="module")
@@ -187,6 +188,10 @@ def _free_port():
 
 class _Stub:
     chunk_size, action_dim = 32, 8
+    flushed = 0
+
+    def flush(self):
+        self.flushed += 1
 
     def infer(self, obs, *, seed=None):
         if "explode" in obs:
@@ -202,10 +207,11 @@ def test_server_speaks_the_openpi_protocol():
     loop = asyncio.new_event_loop()
     ready = asyncio.Event()
     stop = loop.create_future()
+    stub = _Stub()
 
     async def main():
         task = asyncio.ensure_future(
-            serve_async(_Stub(), host="127.0.0.1", port=port, metadata={"name": "stub"}, ready=ready)
+            serve_async(stub, host="127.0.0.1", port=port, metadata={"name": "stub"}, ready=ready)
         )
         await stop
         task.cancel()
@@ -232,6 +238,7 @@ def test_server_speaks_the_openpi_protocol():
         assert "infer_ms" in response["server_timing"]
         conn.send(packer.pack({"observation/gripper_position": np.array([1.0], np.float32)}))
         assert "prev_total_ms" in protocol.unpackb(conn.recv())["server_timing"]
+        assert stub.flushed == 2  # after every response: deferred work never delays one
         conn.send(packer.pack({"explode": True}))
         error = conn.recv()
         assert isinstance(error, str) and "boom" in error
@@ -273,3 +280,50 @@ def test_nonfinite_actions_are_rejected_before_logging(tmp_path, monkeypatch, va
     with pytest.raises(RuntimeError, match="non-finite actions"):
         adapter.infer(sample_obs())
     assert not (tmp_path / "logs").exists()
+
+
+class _DecodingVAE(FakeVideoVAE):
+    """Shape-only decode: (B, 96, T, h, w) -> (B, 3, 4 T - 3, 32 h, 32 w) in [-1, 1]."""
+
+    def decode(self, z):
+        b, _, t, h, w = z.shape
+        value = torch.tanh(z.float().mean(dim=1, keepdim=True))
+        frames = value.repeat_interleave(4, dim=2)[:, :, 3:]
+        return F.interpolate(frames, scale_factor=(1, 32, 32)).expand(b, 3, 4 * t - 3, 32 * h, 32 * w)
+
+
+def test_imagined_video_is_saved_after_the_response(tmp_path):
+    av = pytest.importorskip("av")
+    pytest.importorskip("PIL")
+    policy = droid_policy(_DecodingVAE())
+    adapter = RoboLabPolicy(policy, log_dir=tmp_path, save_video=True)
+    obs = sample_obs()
+    adapter.infer(obs)
+    stem = tmp_path / "query_000001"
+    assert (tmp_path / "query_000001.npz").is_file()
+    assert not stem.with_name("query_000001_imagined.mp4").exists()  # decoding waits for flush()
+    adapter.flush()
+    from PIL import Image
+
+    image = np.asarray(Image.open(stem.with_name("query_000001_input.png")))
+    np.testing.assert_array_equal(image, obs["observation/image"])
+    condition, future = policy.last_video_tokens
+    h, w = policy.config.latent_hw
+    expected_frames = 4 * (condition.shape[1] + future.shape[1]) // (h * w) - 3
+    with av.open(str(stem.with_name("query_000001_imagined.mp4"))) as container:
+        frames = [frame.to_ndarray(format="rgb24") for frame in container.decode(video=0)]
+    assert len(frames) == expected_frames and frames[0].shape == (540, 640, 3)
+    sheet = np.asarray(Image.open(stem.with_name("query_000001_imagined.png")))
+    assert sheet.shape == (270, 320 * (1 + (expected_frames - 1) // 8), 3)
+    # A query that was not flushed is written before the next prediction replaces its tokens.
+    adapter.infer(obs)
+    adapter.infer(obs)
+    assert stem.with_name("query_000002_imagined.mp4").is_file()
+    assert not stem.with_name("query_000003_imagined.mp4").exists()
+    adapter.flush()
+    assert stem.with_name("query_000003_imagined.mp4").is_file()
+
+
+def test_saving_video_needs_a_log_dir():
+    with pytest.raises(ValueError, match="log_dir"):
+        RoboLabPolicy(droid_policy(), save_video=True)
